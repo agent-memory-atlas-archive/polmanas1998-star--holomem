@@ -1,0 +1,46 @@
+# Packaging for a single-module library.
+#
+# WHY THIS FILE EXISTS
+# --------------------
+# Measured 06/09/2026: a fresh clone of `membench`, which depends on this
+# library, ran its test suite and showed **20 failures**. Not because anything
+# was broken, but because `holomem` could not be imported: it was a loose
+# `holomem.py` with no way to install it, so the only route was to clone it by
+# hand and point an environment variable at the folder.
+#
+# A benchmark a stranger cannot run is not a public benchmark. Twenty red tests
+# on first contact say "this is broken" far louder than any README says
+# "set HOLOMEM_PATH first".
+#
+# With this file:
+#
+#     pip install git+https://github.com/polmanas1998-star/holomem
+#
+# and the environment variable becomes optional rather than mandatory.
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "holomem"
+version = "0.1.0"
+description = "A holographic memory that ages: one fixed-size trace, a confidence gate that stays silent when it is not sure."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24"]
+keywords = ["memory", "vsa", "hrr", "holographic", "hyperdimensional"]
+
+[[project.authors]]
+name = "Hakim Ogan"
+
+[project.urls]
+Homepage = "https://github.com/polmanas1998-star/holomem"
+
+# One module, not a package: `py-modules` rather than `packages`. Listing it
+# explicitly matters, because auto-discovery in a repository that also holds
+# `bench_*.py` and `plot_results.py` at the top level would either fail or
+# quietly ship the benchmarks as importable modules.
+[tool.setuptools]
+py-modules = ["holomem"]
