@@ -248,6 +248,17 @@ class HolographicMemory:
     #: of a memory you no longer have.
     MIN_WEIGHT = 0.18
 
+    #: How far above the pack a winner must stand before the memory will say
+    #: it, counted in the losers' own standard deviations. Scale-free on
+    #: purpose: an absolute margin drifts with the size of the trace, this does
+    #: not, so one number holds from N=25 to N=500.
+    Z_GATE = 4.0
+
+    #: Absolute cosine floor, used ONLY when the pool holds fewer than three
+    #: candidates and no spread can be measured. Derived, not chosen: see the
+    #: measurement in `query_gated`. Never used when a z is computable.
+    MIN_ABSOLUTE = 0.40
+
     #: What relearning an existing fact adds, and the ceiling it saturates at.
     #: Saturation matters: without it, one chatty week would make a fact
     #: permanently louder than everything learned since.
@@ -366,11 +377,16 @@ class HolographicMemory:
     def _cleanup(self, probe: np.ndarray, pool: list[str]):
         """Snap an approximate probe to the nearest known symbol.
 
-        Returns (name, score, margin). **The margin is the useful number**, not
-        the score. A high score with a low margin means the memory is torn
-        between two candidates, which is exactly the situation where you should
-        say nothing rather than assert the winner. Sections 3 and 4 of the
-        README use the margin as the confidence gate.
+        Returns (name, score, margin). A high score with a low margin means the
+        memory is torn between two candidates, which is exactly the situation
+        where you should say nothing rather than assert the winner.
+
+        **Do not gate on this margin.** It is absolute, so it shrinks as the
+        trace fills, and a fixed threshold on it silently stops firing exactly
+        when you start needing one: 0.10 passed at N=25 and passed 0.3% of
+        queries at N=100. Sections 3 and 4 of the README, and every `gated` and
+        `cover` number in the capacity table, use the z of the winner against
+        the spread of the candidates it beat. That is `query_gated`.
         """
         if not pool:
             return None, 0.0, 0.0
@@ -381,9 +397,74 @@ class HolographicMemory:
         return best, float(best_score), float(margin)
 
     def query(self, s: str, r: str):
-        """"What is the object of (s, r)?" Returns (object, score, margin)."""
+        """"What is the object of (s, r)?" Returns (object, score, margin).
+
+        Ungated: this always names a winner, however torn the memory is. For
+        the operating point the README publishes, use `query_gated`.
+        """
         probe = unbind(self.trace, bind(symbol(s, self.dim), symbol(r, self.dim)))
         return self._cleanup(probe, self._pools()[1])
+
+    def query_gated(self, s: str, r: str, z_gate: float = Z_GATE):
+        """`query`, but silent when the winner does not stand clear of the pack.
+
+        Returns `(object, z)`, and `object is None` means **the memory declines
+        to answer**. `z` is how many standard deviations the winner stands above
+        the candidates it beat, measured in the losers' own spread rather than
+        against a constant. That is what makes one threshold hold at every N,
+        and it is the gate behind every `gated` and `cover` number in the
+        capacity table.
+
+        This exists because it did not. The table was produced by the bench,
+        which computed z inline, while the shipped library only ever exposed the
+        absolute margin: a reader who followed the README could not reach the
+        published operating point through the public API. Measured 05/09/2026.
+        """
+        pool = self._pools()[1]
+        probe = unbind(self.trace, bind(symbol(s, self.dim), symbol(r, self.dim)))
+        if not pool:
+            return None, 0.0
+        scored = sorted(((csim(probe, symbol(n, self.dim)), n) for n in pool),
+                        reverse=True)
+        # Two losers is the minimum for a spread to mean anything. Below that
+        # there is nothing to be uncertain against, so the gate cannot be
+        # EVALUATED. It used to return `math.inf` here, which said the
+        # opposite: a store holding one or two distinct objects answered EVERY
+        # question at a confidence above any threshold anyone could set.
+        # Measured 07/09/2026 in membench's `chambre_close.py`: six inventions
+        # out of six on pairs nobody had ever stated, at z = inf. A service
+        # that has just started, or whose erasure request has just emptied it,
+        # was maximally confident exactly when it knew the least.
+        #
+        # Refusing outright would have been the other extreme, and the test
+        # that froze the old behaviour was right to call it arbitrary: a store
+        # of two objects does know its two facts.
+        #
+        # There is a third way, and it is available because the two
+        # populations do not overlap in this regime. Measured over 30 seeds at
+        # d = 128, 256, 512, 2048 and 8192, with one and two objects in the
+        # pool: the worst score for a fact the store WAS told is 0.6403, the
+        # best score for a pair nobody ever stated is 0.1651. The narrowest
+        # margin anywhere is 0.4752. `MIN_ABSOLUTE` sits at 0.40, near the
+        # middle of that gap, 0.235 above the worst false positive and 0.240
+        # below the worst true one.
+        #
+        # ⚠ An absolute floor is only legitimate HERE. It does not transport
+        # to a full pool, which is the whole reason this class moved to a z in
+        # the first place: a fixed margin of 0.10 admitted 0.0% of answers the
+        # z gate admits at precision 1.000. The floor applies where a z cannot
+        # be computed at all, and nowhere else.
+        #
+        # The `0.0` returned as z is not a measurement, it is the same
+        # 'no separation observed' this method already returns for an empty
+        # pool. Anything else would be a number invented to look like one.
+        if len(scored) < 3:
+            return ((scored[0][1] if scored[0][0] >= self.MIN_ABSOLUTE else None),
+                    0.0)
+        head = scored[0][0]
+        rest = np.array([sc for sc, _ in scored[1:]], dtype=float)
+        z = float((head - rest.mean()) / (rest.std() + 1e-12))
+        return (scored[0][1] if z >= z_gate else None), z
 
     def query_subject(self, r: str, o: str):
         """The inverse: "which subject satisfies (?, r, o)?"

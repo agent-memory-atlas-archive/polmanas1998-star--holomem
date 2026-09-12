@@ -270,3 +270,145 @@ def test_readme_example():
     assert (score, margin) == (pytest.approx(0.190, abs=5e-4),
                                pytest.approx(0.175, abs=5e-4))
     assert score > m.noise_floor()
+
+
+# ── the gate the library did not expose ────────────────────────────────────
+#
+# Until 05/09/2026 the z gate lived only in bench_capacity.py. The table in the
+# README was produced with it; the shipped `query` returned the absolute margin
+# the same README describes as the bug it replaced. A reader who followed the
+# README could not reach the published operating point through the public API,
+# and `fidelity_check` could not catch it because it discards the margin.
+
+def test_query_invents_an_answer_for_a_fact_never_stated():
+    """The defect `query_gated` exists to fix. Pinned so it cannot be forgotten."""
+    m = HolographicMemory(dim=1024)
+    for s, r, o in (("ana", "works_on", "compiler"), ("bo", "works_on", "kernel"),
+                    ("cy", "lives_in", "lisbon"), ("dee", "works_on", "parser")):
+        m.learn(s, r, o)
+    name, score, margin = m.query("nobody", "never_said")
+    assert name is not None, "ungated query always names a winner"
+    assert score < 0.2, "and it does so on a score indistinguishable from noise"
+    # Nothing in the tuple tells the caller this is fabricated.
+    assert margin < 0.2
+
+
+def test_query_gated_declines_the_fact_that_was_never_stated():
+    m = HolographicMemory(dim=1024)
+    for s, r, o in (("ana", "works_on", "compiler"), ("bo", "works_on", "kernel"),
+                    ("cy", "lives_in", "lisbon"), ("dee", "works_on", "parser")):
+        m.learn(s, r, o)
+    answer, z = m.query_gated("nobody", "never_said")
+    assert answer is None
+    assert z < HolographicMemory.Z_GATE
+
+
+def test_query_gated_still_answers_what_it_actually_knows():
+    m = HolographicMemory(dim=1024)
+    for s, r, o in (("ana", "works_on", "compiler"), ("bo", "works_on", "kernel"),
+                    ("cy", "lives_in", "lisbon"), ("dee", "works_on", "parser")):
+        m.learn(s, r, o)
+    answer, z = m.query_gated("ana", "works_on")
+    assert answer == "compiler"
+    assert z >= HolographicMemory.Z_GATE
+
+
+def test_an_absolute_margin_gate_stops_firing_while_the_memory_is_still_right():
+    """The failure that motivated z, reproduced rather than asserted.
+
+    At d=1024, N=100 the memory answers 99% of queries correctly, and a fixed
+    absolute threshold of 0.10 admits none of them. A confidence gate that
+    closes completely while the thing behind it is still right is worse than no
+    gate: it converts a working memory into a silent one, and nothing in the
+    numbers says why. Measured 05/09/2026.
+
+    One fact at one N is a coin flip, so this counts admissions over the whole
+    corpus. An earlier version of this test asserted on a single fact and
+    failed on sampling noise.
+    """
+    dim, n = 1024, 100
+    m = HolographicMemory(dim=dim)
+    facts = [(f"s{i}", f"r{i}", f"o{i}") for i in range(n)]
+    for s, r, o in facts:
+        m.learn(s, r, o)
+
+    correct = admitted_by_z = correct_when_admitted = admitted_by_margin = 0
+    for s, r, o in facts:
+        name, _, margin = m.query(s, r)
+        _, z = m.query_gated(s, r)
+        correct += name == o
+        if z >= HolographicMemory.Z_GATE:
+            admitted_by_z += 1
+            correct_when_admitted += name == o
+        if margin >= 0.10:
+            admitted_by_margin += 1
+
+    assert correct / n > 0.95, "the memory itself is still working at this N"
+    assert admitted_by_margin / n < 0.05, (
+        "an absolute margin gate admits almost nothing here, which is the bug"
+    )
+    assert admitted_by_z / n > 0.5, "the z gate keeps most of a working memory"
+    assert correct_when_admitted == admitted_by_z, (
+        "and what it admits is right"
+    )
+
+
+def test_library_z_matches_the_bench_z_on_the_same_trace():
+    """The fidelity check `fidelity_check` does not do.
+
+    It compares winners and scores and throws the margin away, so the gate was
+    free to differ between the bench and the library for as long as it liked.
+    Here the two are computed side by side and must agree.
+    """
+    dim, n = 512, 40
+    m = HolographicMemory(dim=dim)
+    names = [(f"s{i}", f"r{i}", f"o{i}") for i in range(n)]
+    for s, r, o in names:
+        m.learn(s, r, o)
+
+    pool = [o for _, _, o in names]
+    pool_matrix = np.stack([symbol(o, dim) / np.linalg.norm(symbol(o, dim))
+                            for o in pool])
+    for s, r, _ in names:
+        probe = unbind(m.trace, bind(symbol(s, dim), symbol(r, dim)))
+        probe = probe / np.linalg.norm(probe)
+        scores = np.sort(np.real(probe @ np.conjugate(pool_matrix).T))[::-1]
+        head, rest = scores[0], scores[1:]
+        bench_z = (head - rest.mean()) / (rest.std() + 1e-12)
+        _, lib_z = m.query_gated(s, r)
+        assert lib_z == pytest.approx(bench_z, rel=1e-6), (
+            f"library gate drifted from the bench gate on ({s}, {r})"
+        )
+
+
+def test_without_a_spread_the_gate_falls_back_to_an_absolute_floor():
+    """Two losers is the minimum for a z. Below that the gate measures
+    something else instead of inventing a number.
+
+    The old contract returned `math.inf` here, and it kept exactly half of
+    what it should: the store answered its two real facts, and it also
+    answered every pair nobody had ever stated, at a confidence above any
+    threshold. Measured 07/09/2026: six inventions out of six.
+
+    Refusing outright would have lost the other half, and the docstring of
+    the old test was right about that: a store of two objects does know its
+    two facts. Both halves are kept because the populations do not overlap
+    in this regime, worst true 0.6403 against best false 0.1651 over five
+    dimensions and 30 seeds.
+    """
+    m = HolographicMemory(dim=512)
+    m.learn("ana", "works_on", "compiler")
+    m.learn("bo", "works_on", "kernel")
+
+    # The half the old test protected, and it still holds.
+    answer, z = m.query_gated("ana", "works_on")
+    assert answer == "compiler", "a two-object store no longer knows its own facts"
+    assert z == 0.0, "z is not computable here and must not pretend otherwise"
+
+    # The half it did not protect, and this is the whole point of the change.
+    invented, z2 = m.query_gated("zoe", "works_on")
+    assert invented is None, (
+        "the gate answers a pair nobody ever stated: this is the tiny-store "
+        "defect, six inventions out of six when it was measured"
+    )
+    assert z2 == 0.0
